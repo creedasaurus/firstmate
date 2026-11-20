@@ -1,0 +1,2 @@
+ok - shell-history-ignorespace prefixes pane setup and launch lines with a space
+ok - without shell-history-ignorespace pane lines are sent unchanged
