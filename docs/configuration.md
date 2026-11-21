@@ -1313,17 +1313,21 @@ The skill text owns the marker spelling, the tick order, and the reinforcement r
 
 ## Stow guard (config/stow-guard)
 
-`config/stow-guard` is an optional local, gitignored file that asks a Claude primary to run `/stow` while there is still room before context compaction.
+`config/stow-guard` is an optional local, gitignored file that asks a Claude or Pi primary to run `/stow` while there is still room before context compaction.
 Without the file the session is unchanged.
 
-With the file present, the Claude Stop hook `bin/fm-stow-guard.sh` blocks one turn end and tells that session to run the existing `/stow` skill.
-It asks when the newest context reading in the transcript tail is at least `tokens` (default 300000), once per crossing, and again only after a later reading falls below two-thirds of that line.
+With the file present, `bin/fm-stow-guard.sh` tells that session to run the existing `/stow` skill.
+On Claude it is a Stop hook that blocks one turn end.
+On Pi the tracked turn-end extension calls it after a logical run settles and sends the ask as one follow-up, never on a settle that already sent the turn-end guard's follow-up.
+It asks when the newest context reading is at least `tokens` (default 300000), once per crossing, and again only after a later reading falls below two-thirds of that line.
+On Pi, set `tokens` below the model's context window minus Pi's `compaction.reserveTokens`, with room for one `/stow` pass, because Pi compacts at that point without asking first.
 It also asks when the newest `/stow` it has seen is at least `hours` old (default 24), and then not again for an hour.
+On Claude a `/stow` is a `Skill` call in the transcript tail; on Pi it is a typed `/skill:stow` or a `read` of the stow skill's `SKILL.md`.
 That age ask is skipped when a `/stow` timestamp cannot be read.
 The stored state is what makes each ask once per crossing, so a continuation stop is handled like any other stop.
 A hook error does not block the turn, and the hook never compacts the session itself.
-It runs for a plain Claude primary checkout of this home.
-It stays silent in a crew worktree and in a marked secondmate home, because a Stop block there leaves the parent recording that mate as idle while it is still working.
+It runs for a plain primary checkout of this home.
+It stays silent in a crew worktree and in a marked secondmate home, because a Stop block there leaves the parent recording that mate as idle while it is still working, and the primary's `/stow` already reaches its secondmates.
 The file is per home and is not inherited.
 Blank lines and lines that start with `#` are ignored.
 Optional lines are `tokens=<n>` and `hours=<n>`.

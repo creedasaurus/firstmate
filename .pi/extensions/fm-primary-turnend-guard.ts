@@ -512,16 +512,18 @@ function runGuard(): Promise<{ code: number; stderr: string }> {
 // pi.on("tool_call", ...) can block (verified 2026-07-09 against pi 0.80.5:
 // returning {block: true} prevents the bash command from running). Each owner
 // script owns its own decision and is inert outside the real primary checkout.
-function runChecker(script: string, command: string): Promise<{ code: number; stderr: string }> {
+function runChecker(
+  script: string,
+  args: string[],
+  timeoutMs?: number,
+): Promise<{ code: number; stderr: string }> {
   return new Promise((resolveResult) => {
-    const invocation = firstmateShellInvocation(
-      `${root}/bin/${script}`,
-      ["--command", command],
-    );
+    const invocation = firstmateShellInvocation(`${root}/bin/${script}`, args);
     let child: ChildProcess;
     try {
       child = spawn(invocation.command, invocation.args, {
         stdio: ["ignore", "ignore", "pipe"],
+        timeout: timeoutMs,
       });
     } catch {
       resolveResult({ code: 0, stderr: "" });
@@ -537,11 +539,34 @@ function runChecker(script: string, command: string): Promise<{ code: number; st
 }
 
 function runPretoolCheck(command: string): Promise<{ code: number; stderr: string }> {
-  return runChecker("fm-arm-pretool-check.sh", command);
+  return runChecker("fm-arm-pretool-check.sh", ["--command", command]);
 }
 
 function runCdCheck(command: string): Promise<{ code: number; stderr: string }> {
-  return runChecker("fm-cd-pretool-check.sh", command);
+  return runChecker("fm-cd-pretool-check.sh", ["--command", command]);
+}
+
+// Opt-in /stow ask before compaction (config/stow-guard, docs/configuration.md
+// "Stow guard"). bin/fm-stow-guard.sh owns the decision and its state; this
+// file only reports the context size and the newest /stow it has seen.
+type StowGuardContext = SessionStartContext & {
+  getContextUsage?: () => { tokens?: number | null } | undefined;
+};
+
+const stowSkillRead = /(^|[\\/])\.agents[\\/]skills[\\/]stow[\\/]SKILL\.md$/;
+
+function runStowGuard(ctx: StowGuardContext, lastStow: number): Promise<{ code: number; stderr: string }> {
+  let tokens = 0;
+  try {
+    const reading = ctx.getContextUsage?.()?.tokens;
+    if (typeof reading === "number" && Number.isFinite(reading) && reading > 0) tokens = Math.floor(reading);
+  } catch {
+  }
+  const args = ["--context-tokens", String(tokens), "--session-id", sessionIdFromContext(ctx) || "session"];
+  if (lastStow > 0) args.push("--last-stow", String(lastStow));
+  // Bounded like the Claude Stop hook's 10s; a killed child closes with no
+  // exit code and is treated as no ask.
+  return runChecker("fm-stow-guard.sh", args, 10000);
 }
 
 export default function (pi: ExtensionAPI) {
@@ -623,7 +648,20 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
+  let lastStowSeen = 0;
+  const noteStow = (): void => {
+    lastStowSeen = Math.floor(Date.now() / 1000);
+  };
+
+  pi.on?.("input", (event) => {
+    if (event.source !== "extension" && /^\/skill:stow(\s|$)/.test(String(event.text ?? ""))) noteStow();
+  });
+
   pi.on("tool_call", async (event) => {
+    if (event.type === "tool_call" && event.toolName === "read" &&
+        stowSkillRead.test(resolve(String((event.input as { path?: unknown })?.path ?? "")))) {
+      noteStow();
+    }
     if (event.type !== "tool_call" || event.toolName !== "bash") return {};
     const command = String((event.input as { command?: unknown })?.command ?? "");
     if (!command) return {};
@@ -636,14 +674,27 @@ export default function (pi: ExtensionAPI) {
     return { block: true, reason: result.stderr.trim() || "denied by the watcher-arm PreToolUse seatbelt" };
   });
 
-  pi.on("agent_settled", async () => {
+  pi.on("agent_settled", async (_event, ctx) => {
     if (guardFollowupActive) {
       guardFollowupActive = false;
       return;
     }
 
     const result = await runGuard();
-    if (result.code !== 2) return;
+    if (result.code !== 2) {
+      // Never stacked on a turn-end follow-up; the script's state keeps each
+      // ask to once per crossing, so the ask's own run settles silently.
+      const stow = await runStowGuard(ctx as StowGuardContext, lastStowSeen);
+      if (stow.code !== 2 || !stow.stderr.trim()) return;
+      try {
+        await pi.sendUserMessage(
+          encodeFirstmateOperationalInput("turn-end-guard", stow.stderr.trim()),
+          { deliverAs: "followUp" },
+        );
+      } catch {
+      }
+      return;
+    }
 
     guardFollowupActive = true;
     try {

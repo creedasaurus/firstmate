@@ -1283,6 +1283,98 @@ EOF
   pass ".pi primary extension: delivery failure resets the logical-run latch"
 }
 
+test_pi_extension_asks_for_stow_after_a_quiet_turn_end() {
+  local repo home ext log out status
+  repo="$TMP_ROOT/pi-stow-root"
+  home="$TMP_ROOT/pi-stow-home"
+  ext="$repo/.pi/extensions/fm-primary-turnend-guard.ts"
+  log="$TMP_ROOT/pi-stow-guard.log"
+  mkdir -p "$repo/.pi/extensions/lib" "$repo/bin" "$home/state"
+  cp "$ROOT/.pi/extensions/fm-primary-turnend-guard.ts" "$ext"
+  cp "$ROOT/.pi/extensions/lib/fm-operational-input.ts" "$repo/.pi/extensions/lib/fm-operational-input.ts"
+  cp "$ROOT/bin/fm-operational-input.sh" "$repo/bin/fm-operational-input.sh"
+  cat > "$repo/bin/fm-turnend-guard.sh" <<'SH'
+#!/usr/bin/env bash
+cat >/dev/null
+[ -e "${FM_GUARD_LOG:?}.blind" ] || exit 0
+printf 'blind guard\n' >&2
+exit 2
+SH
+  cat > "$repo/bin/fm-stow-guard.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${FM_GUARD_LOG:?}"
+printf 'fm-stow-guard: stub ask\n' >&2
+exit 2
+SH
+  chmod +x "$repo/bin/fm-turnend-guard.sh" "$repo/bin/fm-stow-guard.sh"
+  out=$(PLUGIN="$ext" FM_HOME="$home" FM_GUARD_LOG="$log" node --input-type=module 2>&1 <<'EOF'
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const log = process.env.FM_GUARD_LOG;
+const calls = () => { try { return readFileSync(log, "utf8").trim().split("\n"); } catch { return []; } };
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+const sent = [];
+const instance = () => {
+  const handlers = new Map();
+  mod.default({
+    on(event, handler) { handlers.set(event, handler); },
+    async sendUserMessage(message, options) { sent.push({ message, options }); },
+  });
+  return handlers;
+};
+const ctx = {
+  getContextUsage: () => ({ tokens: 4321.7 }),
+  sessionManager: { getSessionId: () => "sid-1" },
+};
+
+let h = instance();
+await h.get("agent_settled")({ type: "agent_settled" }, ctx);
+if (calls().at(-1) !== "--context-tokens 4321 --session-id sid-1") throw new Error(`stow guard args: ${calls().at(-1)}`);
+if (sent.length !== 1) throw new Error(`expected one stow ask, saw ${sent.length}`);
+if (!sent[0].message.startsWith("\u2063FIRSTMATE_OP: v1 turn-end-guard: ")) throw new Error(`untyped stow ask: ${sent[0].message}`);
+if (!sent[0].message.includes("fm-stow-guard: stub ask")) throw new Error(`stow ask lost the reason: ${sent[0].message}`);
+if (sent[0].options?.deliverAs !== "followUp") throw new Error("stow ask was not a follow-up");
+
+await h.get("agent_settled")({ type: "agent_settled" }, { getContextUsage: () => ({ tokens: null }) });
+if (calls().at(-1) !== "--context-tokens 0 --session-id session") throw new Error(`unknown usage args: ${calls().at(-1)}`);
+
+await h.get("input")({ type: "input", text: "/skill:stow", source: "extension" }, ctx);
+await h.get("agent_settled")({ type: "agent_settled" }, ctx);
+if (calls().at(-1).includes("--last-stow")) throw new Error("an extension-sourced /skill:stow counted as a stow");
+const before = Math.floor(Date.now() / 1000);
+await h.get("input")({ type: "input", text: "/skill:stow full pass", source: "interactive" }, ctx);
+await h.get("agent_settled")({ type: "agent_settled" }, ctx);
+const seen = Number(/--last-stow ([0-9]+)$/.exec(calls().at(-1))?.[1]);
+if (!(seen >= before)) throw new Error(`typed /skill:stow was not passed: ${calls().at(-1)}`);
+
+h = instance();
+await h.get("tool_call")({ type: "tool_call", toolName: "read", input: { path: "/home/x/.agents/skills/stowaway/SKILL.md" } }, ctx);
+await h.get("agent_settled")({ type: "agent_settled" }, ctx);
+if (calls().at(-1).includes("--last-stow")) throw new Error("another skill's read counted as a stow");
+await h.get("tool_call")({ type: "tool_call", toolName: "read", input: { path: "/home/x/.agents/skills/stow/SKILL.md" } }, ctx);
+await h.get("agent_settled")({ type: "agent_settled" }, ctx);
+if (!/--last-stow [0-9]+$/.test(calls().at(-1))) throw new Error(`stow SKILL.md read was not passed: ${calls().at(-1)}`);
+h = instance();
+await h.get("tool_call")({ type: "tool_call", toolName: "read", input: { path: ".agents/skills/stow/./SKILL.md" } }, ctx);
+await h.get("agent_settled")({ type: "agent_settled" }, ctx);
+if (!/--last-stow [0-9]+$/.test(calls().at(-1))) throw new Error(`relative stow SKILL.md read was not passed: ${calls().at(-1)}`);
+
+const runs = calls().length;
+const asks = sent.length;
+writeFileSync(`${log}.blind`, "");
+await h.get("agent_settled")({ type: "agent_settled" }, ctx);
+rmSync(`${log}.blind`);
+if (calls().length !== runs) throw new Error("stow guard ran on a settle that already sent the turn-end follow-up");
+if (sent.length !== asks + 1 || !sent.at(-1).message.includes("TURN WOULD END BLIND")) throw new Error("turn-end follow-up was not the only ask");
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi extension must ask for /stow after a quiet turn end"
+  [ -z "$out" ] || fail "Pi stow-ask test printed output: $out"
+  pass ".pi primary extension: stow ask follows a quiet settle with usage and seen /stow, never stacked on a turn-end follow-up"
+}
+
 # A Pi command started from inside the live session, such as the `pi --help`
 # capability probe, auto-loads this extension too and passes the ancestor walk
 # in lockOwnership. Its pid dies at once, so the marker must stay on the live
@@ -2716,6 +2808,7 @@ test_codex_hook_preserves_streams_without_login_logout_output
 test_opencode_plugin_anchors_guard_to_worktree
 test_pi_extension_injects_once_per_logical_agent_run
 test_pi_extension_retries_after_followup_delivery_failure
+test_pi_extension_asks_for_stow_after_a_quiet_turn_end
 test_pi_extension_keeps_marker_of_live_ancestor_session
 test_pi_extension_reads_a_windows_tagged_session_lock
 test_hook_claude_mode_reblocks_stop_hook_active_when_unhealthy

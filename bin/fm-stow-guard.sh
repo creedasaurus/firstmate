@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# fm-stow-guard.sh - Claude Stop hook that asks a primary session to /stow
-# before context compaction.
+# fm-stow-guard.sh - asks a primary session to /stow before context
+# compaction. A Claude Stop hook by default; the tracked Pi turn-end extension
+# calls the flag mode below.
 #
 # Opt in by creating the home-local config/stow-guard file. Absent means off.
 # docs/configuration.md "Stow guard" owns that gate and its tunables. This
@@ -30,6 +31,14 @@
 # newest one is remembered in state/.stow-guard.json, so a later tail that no
 # longer contains it does not rewind the clock.
 #
+# Flag mode (--context-tokens <n> [--session-id <id>] [--last-stow <epoch>])
+# takes the context size and the newest /stow the caller saw as arguments
+# instead of reading stdin and a transcript, and runs the same gate, scope,
+# state, and decision. The caller is the stow reader, so a missing --last-stow
+# means no /stow seen. It prints the ask on stderr and exits 2, or exits 0
+# silently, like bin/fm-turnend-guard.sh does for the passive harnesses. An
+# unusable flag value exits 0 silently; an unknown flag exits 64.
+#
 # The hook prints one Claude block decision, or nothing. Any unreadable
 # payload, missing jq, scope miss, or state-write failure exits 0 and prints
 # nothing, so a Stop is never stuck on this hook. It is silent for a Cursor
@@ -51,41 +60,73 @@ CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 usage() {
   cat <<'EOF'
 usage: fm-stow-guard.sh
+       fm-stow-guard.sh --context-tokens <n> [--session-id <id>] [--last-stow <epoch>]
 
 Claude Stop hook. Reads the hook payload on stdin.
+With --context-tokens, reads no stdin and answers with stderr and exit 2.
 Create config/stow-guard to enable it. See the script header.
 EOF
 }
 
-case "${1:-}" in
-  -h|--help) usage; exit 0 ;;
-  "") ;;
-  *) usage >&2; exit 2 ;;
-esac
+flag_mode=0
+flag_tokens='' flag_sid='' flag_last_stow=''
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --context-tokens|--session-id|--last-stow)
+      [ "$#" -ge 2 ] || { usage >&2; exit 64; }
+      case "$1" in
+        --context-tokens) flag_mode=1; flag_tokens=$2 ;;
+        --session-id) flag_sid=$2 ;;
+        --last-stow) flag_last_stow=$2 ;;
+      esac
+      shift 2
+      ;;
+    *) usage >&2; exit 64 ;;
+  esac
+done
 
 if [ -n "${GROK_AGENT:-}${GROK_HOOK_EVENT:-}" ]; then
   exit 0
 fi
 
-if [ -t 0 ]; then
-  usage
-  exit 0
+transcript=
+if [ "$flag_mode" -eq 1 ]; then
+  # A leading zero or an over-long value is unusable, as in config/stow-guard;
+  # the length caps keep the later arithmetic inside integer range.
+  case "$flag_tokens" in
+    0) ;;
+    ''|*[!0-9]*|0*) exit 0 ;;
+  esac
+  case "$flag_last_stow" in
+    '') ;;
+    *[!0-9]*|0*) exit 0 ;;
+  esac
+  [ "${#flag_tokens}" -le 9 ] || exit 0
+  [ "${#flag_last_stow}" -le 12 ] || exit 0
+  sid=${flag_sid:-session}
+  command -v jq >/dev/null 2>&1 || exit 0
+else
+  if [ -t 0 ]; then
+    usage
+    exit 0
+  fi
+
+  payload=$(cat || true)
+  [ -n "$payload" ] || exit 0
+  command -v jq >/dev/null 2>&1 || exit 0
+
+  if ! jq -e . >/dev/null 2>&1 <<<"$payload"; then
+    exit 0
+  fi
+
+  cursor=$(jq -r '.cursor_version // .cursorVersion // empty' <<<"$payload" 2>/dev/null || true)
+  [ -z "$cursor" ] || exit 0
+
+  sid=$(jq -r '.session_id // .sessionId // empty' <<<"$payload" 2>/dev/null || true)
+  [ -n "$sid" ] || sid=session
+  transcript=$(jq -r '.transcript_path // .transcriptPath // empty' <<<"$payload" 2>/dev/null || true)
 fi
-
-payload=$(cat || true)
-[ -n "$payload" ] || exit 0
-command -v jq >/dev/null 2>&1 || exit 0
-
-if ! jq -e . >/dev/null 2>&1 <<<"$payload"; then
-  exit 0
-fi
-
-cursor=$(jq -r '.cursor_version // .cursorVersion // empty' <<<"$payload" 2>/dev/null || true)
-[ -z "$cursor" ] || exit 0
-
-sid=$(jq -r '.session_id // .sessionId // empty' <<<"$payload" 2>/dev/null || true)
-[ -n "$sid" ] || sid=session
-transcript=$(jq -r '.transcript_path // .transcriptPath // empty' <<<"$payload" 2>/dev/null || true)
 
 fm_primary_scope_matches "$FM_ROOT" "$STATE" || exit 0
 fm_root_is_secondmate_home "$FM_ROOT" && exit 0
@@ -160,7 +201,11 @@ fi
 tokens=0
 seen_stow=
 saves_readable=0
-if [ -n "$transcript" ] && [ -r "$transcript" ]; then
+if [ "$flag_mode" -eq 1 ]; then
+  tokens=$flag_tokens
+  seen_stow=$flag_last_stow
+  saves_readable=1
+elif [ -n "$transcript" ] && [ -r "$transcript" ]; then
   tokens=$(tail -c 2000000 "$transcript" | jq -R -r '
       fromjson? | .message.usage // empty | select(type == "object")
       | (.input_tokens // 0) + (.cache_read_input_tokens // 0) + (.cache_creation_input_tokens // 0)
@@ -233,6 +278,10 @@ fi
 mv -f "$tmp" "$state_path" || { rm -f "$tmp"; exit 0; }
 
 if [ -n "$reason" ]; then
+  if [ "$flag_mode" -eq 1 ]; then
+    printf '%s\n' "$reason" >&2
+    exit 2
+  fi
   jq -nc --arg reason "$reason" '{decision:"block", reason:$reason}'
 fi
 exit 0

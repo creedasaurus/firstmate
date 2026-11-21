@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Behavior tests for the opt-in Claude Stop hook that asks a primary to /stow.
+# Behavior tests for the opt-in hook that asks a primary to /stow: the Claude
+# Stop payload path and the flag mode the Pi turn-end extension calls.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -31,6 +32,19 @@ invoke_guard() {
     FM_STATE_OVERRIDE="$state" FM_CONFIG_OVERRIDE="$config" \
     "$@" \
     "$GUARD" >"$OUT" 2>"$ERR"
+}
+
+# invoke_flags <root> <state> <config> <guard args...>
+# Flag mode with no stdin. FM_STOW_GUARD_NOW passes through from the caller.
+invoke_flags() {
+  local root=$1 state=$2 config=$3
+  shift 3
+  : > "$OUT"
+  : > "$ERR"
+  env -u GROK_AGENT -u GROK_HOOK_EVENT \
+    FM_ROOT_OVERRIDE="$root" FM_HOME="$root" \
+    FM_STATE_OVERRIDE="$state" FM_CONFIG_OVERRIDE="$config" \
+    "$GUARD" "$@" >"$OUT" 2>"$ERR" </dev/null
 }
 
 prepare_case() {
@@ -361,6 +375,92 @@ test_tracked_stop_hook_is_synchronous_and_grok_inert() {
   pass "tracked Claude Stop settings run fm-stow-guard.sh once, synchronously, and inert under grok"
 }
 
+assert_flag_ask() {
+  local label=$1 rc=$2 needle=$3
+  [ "$rc" -eq 2 ] || fail "$label must exit 2, got $rc: $(cat "$ERR")"
+  [ ! -s "$OUT" ] || fail "$label wrote stdout: $(cat "$OUT")"
+  grep -qF "$needle" "$ERR" || fail "$label did not ask with '$needle': $(cat "$ERR")"
+}
+
+test_flag_mode_context_asks_on_stderr_once_until_rearm() {
+  local rc=0
+  prepare_case flag-context
+  printf 'tokens=1000\n' > "$CASE_CONFIG/stow-guard"
+  invoke_flags "$PRIMARY" "$CASE_STATE" "$CASE_CONFIG" --context-tokens 1000 --session-id p1 || rc=$?
+  assert_flag_ask "flag crossing" "$rc" "context is 1000 tokens"
+
+  rc=0
+  invoke_flags "$PRIMARY" "$CASE_STATE" "$CASE_CONFIG" --context-tokens 1200 --session-id p1 || rc=$?
+  [ "$rc" -eq 0 ] || fail "second flag crossing must exit 0, got $rc"
+  assert_silent "second flag crossing"
+
+  rc=0
+  invoke_flags "$PRIMARY" "$CASE_STATE" "$CASE_CONFIG" --context-tokens 1500 --session-id p2 || rc=$?
+  assert_flag_ask "another session's crossing" "$rc" "context is 1500 tokens"
+
+  invoke_flags "$PRIMARY" "$CASE_STATE" "$CASE_CONFIG" --context-tokens 100 --session-id p1 || true
+  assert_silent "flag reading below two-thirds"
+  rc=0
+  invoke_flags "$PRIMARY" "$CASE_STATE" "$CASE_CONFIG" --context-tokens 1000 --session-id p1 || rc=$?
+  assert_flag_ask "re-armed flag crossing" "$rc" "context is 1000 tokens"
+  pass "flag mode asks on stderr with exit 2 once per session crossing and re-arms below two-thirds"
+}
+
+test_flag_mode_age_uses_the_callers_last_stow() {
+  local rc=0 now=1700000000
+  prepare_case flag-age
+  : > "$CASE_CONFIG/stow-guard"
+  FM_STOW_GUARD_NOW=$now invoke_flags "$PRIMARY" "$CASE_STATE" "$CASE_CONFIG" --context-tokens 10 || rc=$?
+  [ "$rc" -eq 0 ] || fail "first flag stop must exit 0, got $rc"
+  assert_silent "first flag stop with no /stow seen"
+  jq -e --argjson now "$now" '.last_stow == $now' "$CASE_STATE/.stow-guard.json" >/dev/null \
+    || fail "first flag stop did not start the age clock: $(cat "$CASE_STATE/.stow-guard.json")"
+
+  rc=0
+  FM_STOW_GUARD_NOW=$((now + 86400 + 50)) invoke_flags "$PRIMARY" "$CASE_STATE" "$CASE_CONFIG" \
+    --context-tokens 10 --last-stow $((now + 100)) || rc=$?
+  [ "$rc" -eq 0 ] || fail "recent caller /stow must exit 0, got $rc"
+  assert_silent "a /stow the caller saw inside the window"
+
+  rc=0
+  FM_STOW_GUARD_NOW=$((now + 86400 + 200)) invoke_flags "$PRIMARY" "$CASE_STATE" "$CASE_CONFIG" \
+    --context-tokens 0 || rc=$?
+  assert_flag_ask "aged flag stop" "$rc" "older than 24h"
+  pass "flag mode starts the age clock, honours the caller's /stow, and asks once it ages"
+}
+
+test_flag_mode_is_silent_when_off_out_of_scope_or_unusable() {
+  local rc=0 second="$TMP_ROOT/second"
+  prepare_case flag-off
+  invoke_flags "$PRIMARY" "$CASE_STATE" "$CASE_CONFIG" --context-tokens 900000 || rc=$?
+  [ "$rc" -eq 0 ] || fail "flag mode without config must exit 0, got $rc"
+  assert_silent "flag mode without config/stow-guard"
+
+  printf 'tokens=1000\n' > "$CASE_CONFIG/stow-guard"
+  for value in abc 0900000 1234567890; do
+    rc=0
+    invoke_flags "$PRIMARY" "$CASE_STATE" "$CASE_CONFIG" --context-tokens "$value" || rc=$?
+    [ "$rc" -eq 0 ] || fail "unusable token value $value must exit 0, got $rc"
+    assert_silent "unusable token value $value"
+  done
+  rc=0
+  invoke_flags "$PRIMARY" "$CASE_STATE" "$CASE_CONFIG" --context-tokens 900000 --last-stow x || rc=$?
+  [ "$rc" -eq 0 ] || fail "unusable last-stow must exit 0, got $rc"
+  assert_silent "unusable last-stow"
+  [ ! -e "$CASE_STATE/.stow-guard.json" ] || fail "an unusable flag value wrote trigger state"
+
+  rc=0
+  invoke_flags "$PRIMARY" "$CASE_STATE" "$CASE_CONFIG" --bogus || rc=$?
+  [ "$rc" -eq 64 ] || fail "an unknown flag must exit 64, not the ask status, got $rc"
+
+  [ -d "$second" ] || fail "test_secondmate_home_is_silent must run first"
+  rc=0
+  invoke_flags "$second" "$second/state" "$second/config" --context-tokens 900000 || rc=$?
+  [ "$rc" -eq 0 ] || fail "flag mode in a secondmate home must exit 0, got $rc"
+  assert_silent "flag mode in a secondmate home"
+  pass "flag mode stays silent without the opt-in, for unusable values, and in a secondmate home"
+}
+
 fm_test_run \
   test_absent_config_is_silent \
   test_context_crossing_blocks_once_until_rearm \
@@ -372,4 +472,7 @@ fm_test_run \
   test_missing_python_skips_the_age_ask \
   test_bad_payloads_and_missing_jq_are_silent \
   test_overlong_token_line_keeps_the_default \
-  test_tracked_stop_hook_is_synchronous_and_grok_inert
+  test_tracked_stop_hook_is_synchronous_and_grok_inert \
+  test_flag_mode_context_asks_on_stderr_once_until_rearm \
+  test_flag_mode_age_uses_the_callers_last_stow \
+  test_flag_mode_is_silent_when_off_out_of_scope_or_unusable
