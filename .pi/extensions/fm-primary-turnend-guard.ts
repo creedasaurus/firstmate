@@ -665,6 +665,9 @@ export default function (pi: ExtensionAPI) {
     if (event.type !== "tool_call" || event.toolName !== "bash") return {};
     const command = String((event.input as { command?: unknown })?.command ?? "");
     if (!command) return {};
+    // A primary /stow ends by running the cascade, even when the skill text is
+    // already in context and its SKILL.md is not read again.
+    if (command.includes("fm-stow-cascade.sh")) noteStow();
     const cdResult = await runCdCheck(command);
     if (cdResult.code === 2) {
       return { block: true, reason: cdResult.stderr.trim() || "denied by the cd-guard PreToolUse seatbelt" };
@@ -674,7 +677,7 @@ export default function (pi: ExtensionAPI) {
     return { block: true, reason: result.stderr.trim() || "denied by the watcher-arm PreToolUse seatbelt" };
   });
 
-  pi.on("agent_settled", async (_event, ctx) => {
+  pi.on("agent_settled", async (event, ctx) => {
     if (guardFollowupActive) {
       guardFollowupActive = false;
       return;
@@ -682,6 +685,9 @@ export default function (pi: ExtensionAPI) {
 
     const result = await runGuard();
     if (result.code !== 2) {
+      // An Escape-aborted run is the captain's interrupt; Claude's Stop hook
+      // does not run there either.
+      if ((event as { aborted?: unknown }).aborted === true) return;
       // Never stacked on a turn-end follow-up; the script's state keeps each
       // ask to once per crossing, so the ask's own run settles silently.
       const stow = await runStowGuard(ctx as StowGuardContext, lastStowSeen);

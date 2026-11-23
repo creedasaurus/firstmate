@@ -1360,7 +1360,19 @@ await h.get("tool_call")({ type: "tool_call", toolName: "read", input: { path: "
 await h.get("agent_settled")({ type: "agent_settled" }, ctx);
 if (!/--last-stow [0-9]+$/.test(calls().at(-1))) throw new Error(`relative stow SKILL.md read was not passed: ${calls().at(-1)}`);
 
-const runs = calls().length;
+h = instance();
+await h.get("tool_call")({ type: "tool_call", toolName: "bash", input: { command: "true" } }, ctx);
+await h.get("agent_settled")({ type: "agent_settled" }, ctx);
+if (calls().at(-1).includes("--last-stow")) throw new Error("an unrelated bash call counted as a stow");
+await h.get("tool_call")({ type: "tool_call", toolName: "bash", input: { command: "bin/fm-stow-cascade.sh" } }, ctx);
+await h.get("agent_settled")({ type: "agent_settled" }, ctx);
+if (!/--last-stow [0-9]+$/.test(calls().at(-1))) throw new Error(`stow cascade was not passed: ${calls().at(-1)}`);
+
+let runs = calls().length;
+await h.get("agent_settled")({ type: "agent_settled", aborted: true }, ctx);
+if (calls().length !== runs) throw new Error("stow guard ran on an aborted settle");
+
+runs = calls().length;
 const asks = sent.length;
 writeFileSync(`${log}.blind`, "");
 await h.get("agent_settled")({ type: "agent_settled" }, ctx);

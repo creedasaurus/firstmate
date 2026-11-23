@@ -254,14 +254,17 @@ if [ -n "$seen_stow" ]; then
 fi
 
 reason=
+# On Pi the run has already ended when the ask arrives; on Claude it has not.
+after=', then continue the turn you were in.'
+[ "$flag_mode" -eq 0 ] || after=', then pick up where you left off.'
 has_fired=$(jq -r --arg sid "$sid" 'if .[$sid] == true then "1" else "0" end' <<<"$fired") || exit 0
 if [ "$tokens" -ge "$threshold" ] && [ "$has_fired" -eq 0 ]; then
-  reason="fm-stow-guard: context is ${tokens} tokens, near auto-compaction. Run the /stow skill now (full pass), then continue the turn you were in."
+  reason="fm-stow-guard: context is ${tokens} tokens, near auto-compaction. Run the /stow skill now (full pass)${after}"
   fired=$(jq -c --arg sid "$sid" '.[$sid] = true' <<<"$fired") || exit 0
 elif [ "$saves_readable" -eq 1 ] && [ -z "$last_stow" ]; then
   last_stow=$now
 elif [ "$saves_readable" -eq 1 ] && [ $((now - last_stow)) -ge "$max_age" ] && [ $((now - asked)) -ge 3600 ]; then
-  reason="fm-stow-guard: the last /stow is older than ${hours}h. Run the /stow skill now (full pass), then continue the turn you were in."
+  reason="fm-stow-guard: the last /stow is older than ${hours}h. Run the /stow skill now (full pass)${after}"
 fi
 if [ -n "$reason" ]; then
   asked=$now
