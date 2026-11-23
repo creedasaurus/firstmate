@@ -3638,6 +3638,44 @@ ok - Pi 1.4.0 installed RPC read guard: veto, abort, durable latch, operational 
 No macOS or Windows ancestry, native-adapter interception, separate native-tool execution, terminal screenshot/display, worker or fleet-wide protection is claimed.
 The runtime fixture does not reproduce spontaneous model-loop onset or establish a model/serving root cause.
 
+## Pi stow guard
+
+Verified on 2026-11-23 on macOS with Pi 1.6.0 and model gpt-6.2-sol at low thinking.
+The operator contract is owned by [configuration](../configuration.md#stow-guard-configstow-guard).
+The session ran in a scratch clone of this branch on a private tmux socket, with `-e .pi/extensions/fm-primary-turnend-guard.ts`, no other firstmate extension, `tokens=20000` in the scratch home's `config/stow-guard`, and project `compaction.reserveTokens` set so Pi compacted near 45k on the model's 225k window.
+Logging wrappers around `bin/fm-turnend-guard.sh` and `bin/fm-stow-guard.sh` recorded each call; excerpts below keep their argument and exit fields.
+
+1. The ask arrived as one follow-up after the settle that crossed the line, with the turn-end guard quiet on that settle.
+
+```text
+fm-turnend-guard args=[] rc=0
+fm-stow-guard args=[--context-tokens 24102 --session-id <sid>] rc=2 err=fm-stow-guard: context is 24102 tokens, near auto-compaction. Run the /stow skill now (full pass), then pick up where you left off.
+```
+
+2. The model loaded the skill with a `read` of its absolute `SKILL.md` path, and with no open work it ended the pass without running `bin/fm-stow-cascade.sh`.
+
+```text
+{"name":"read","arguments":{"path":"<lab>/project/.agents/skills/stow/SKILL.md","offset":1,"limit":35}}
+```
+
+3. The next settle passed the stow the extension had seen.
+
+```text
+fm-stow-guard args=[--context-tokens 24923 --session-id <sid> --last-stow 1795469847] rc=0
+```
+
+4. Later settles above the line, at 24941 and 28679 tokens, did not ask again.
+5. The first settle after a threshold compaction read a number, not null, because the compaction's session-start digest starts one more model response before the run settles.
+
+```text
+compaction tokensBefore=67247, then tokensBefore=45174
+fm-stow-guard args=[--context-tokens 15762 --session-id <sid> --last-stow 1795469847] rc=0
+```
+
+Both compactions in item 5 happened inside one run with no ask first, which is the gap a layer that cancels a `threshold` compaction would close.
+The 15762-token reading after compaction stayed above two-thirds of the 20000 line, so this scratch setting never re-armed; the configuration owner states the floor.
+Not verified: an ask landing on the same settle as a supervision-branch outcome, the age ask, and Windows.
+
 ## OpenCode 1 compatibility of the dual-export plugins
 
 Verified on 2026-10-15 on Linux x86_64 against OpenCode 1.15.7, 1.18.20, and 1.18.31, each installed into a scratch npm prefix and run against a scratch `FM_HOME`.

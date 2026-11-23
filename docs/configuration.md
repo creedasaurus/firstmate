@@ -1321,6 +1321,7 @@ On Claude it is a Stop hook that blocks one turn end.
 On Pi the tracked turn-end extension calls it after a logical run settles and sends the ask as one follow-up, never on a settle that already sent the turn-end guard's follow-up.
 It asks when the newest context reading is at least `tokens` (default 300000), once per crossing, and again only after a later reading falls below two-thirds of that line.
 On Pi, set `tokens` below the model's context window minus Pi's `compaction.reserveTokens`, with room for one `/stow` pass, because Pi compacts at that point without asking first.
+Keep it well above one and a half times Pi's `compaction.keepRecentTokens` (30000 with the default), or the context left after a compaction never falls below two-thirds of the line and the ask does not re-arm.
 It also asks when the newest `/stow` it has seen is at least `hours` old (default 24), and then not again for an hour.
 On Claude a `/stow` is a `Skill` call in the transcript tail; on Pi it is a typed `/skill:stow` or a `read` of the stow skill's `SKILL.md`.
 That age ask is skipped when a `/stow` timestamp cannot be read.
